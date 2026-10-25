@@ -3,11 +3,14 @@ import {
   Upload, FileText, CheckCircle2, AlertTriangle, RefreshCw, ZoomIn, ZoomOut, 
   Trash2, Save, Eye, Layers, DollarSign, Calendar, Building, ShieldAlert,
   ArrowRight, File, HelpCircle, Check, X, AlertCircle, PieChart, BarChart3,
-  Receipt, Download, Filter, Calculator
+  Receipt, Download, Filter, Calculator, Camera, Key, Settings, Sparkles
 } from 'lucide-react';
 
 // --- CONFIG & UTILS ---
-const GEMINI_VISION_MODEL = "gemini-3.1-flash-image";
+const GEMINI_VISION_MODEL = "gemini-1.5-flash"; // 安定稼働用Visionモデル
+const STORAGE_KEY_API = "receipt_ocr_gemini_api_key";
+const STORAGE_KEY_HISTORY = "receipt_ocr_history_data";
+
 const RECEIPT_OCR_SYSTEM_PROMPT = `
 あなたは日本の領収書・レシートの解析における最高レベルの専門AIです。
 画像内に含まれる1つまたは複数の領収書から、正確な情報を構造化JSONデータとして抽出してください。
@@ -76,13 +79,48 @@ const RECEIPT_JSON_SCHEMA = {
   }
 };
 
+const DEFAULT_HISTORY = [
+  { 
+    id: "HIST-1", 
+    store_name: "セブン-イレブン", 
+    transaction_date: "2026-10-20", 
+    total_amount: 1480,
+    tax_amount: 120,
+    tax_breakdown: [
+      { rate: 8, target_amount: 1000, tax_amount: 80 },
+      { rate: 10, target_amount: 400, tax_amount: 40 }
+    ],
+    invoice_number: "T1234567890123",
+    summary: "会議用軽食・お茶代"
+  },
+  { 
+    id: "HIST-2", 
+    store_name: "スターバックスコーヒー", 
+    transaction_date: "2026-10-22", 
+    total_amount: 650,
+    tax_amount: 59,
+    tax_breakdown: [
+      { rate: 10, target_amount: 591, tax_amount: 59 }
+    ],
+    invoice_number: "T9876543210987",
+    summary: "打ち合わせ喫茶代"
+  }
+];
+
 export default function App() {
   // State
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem(STORAGE_KEY_API) || "");
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [selectedFile, setSelectedFile] = useState(null);
   const [imagePreviewUrl, setImagePreviewUrl] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingStep, setProcessingStep] = useState("");
   
+  // Camera Modal State
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+
   // Navigation & View Mode State ("ocr" | "analytics")
   const [activeTab, setActiveTab] = useState("ocr");
 
@@ -90,58 +128,16 @@ export default function App() {
   const [extractedReceipts, setExtractedReceipts] = useState([]);
   const [activeReceiptIndex, setActiveReceiptIndex] = useState(0);
   
-  // History Records
-  const [historyRecords, setHistoryRecords] = useState([
-    { 
-      id: "HIST-1", 
-      store_name: "セブン-イレブン", 
-      transaction_date: "2026-10-20", 
-      total_amount: 1480,
-      tax_amount: 120,
-      tax_breakdown: [
-        { rate: 8, target_amount: 1000, tax_amount: 80 },
-        { rate: 10, target_amount: 400, tax_amount: 40 }
-      ],
-      invoice_number: "T1234567890123",
-      summary: "会議用軽食・お茶代"
-    },
-    { 
-      id: "HIST-2", 
-      store_name: "スターバックスコーヒー", 
-      transaction_date: "2026-10-22", 
-      total_amount: 650,
-      tax_amount: 59,
-      tax_breakdown: [
-        { rate: 10, target_amount: 591, tax_amount: 59 }
-      ],
-      invoice_number: "T9876543210987",
-      summary: "打ち合わせ喫茶代"
-    },
-    { 
-      id: "HIST-3", 
-      store_name: "ヨドバシカメラ", 
-      transaction_date: "2026-10-24", 
-      total_amount: 15400,
-      tax_amount: 1400,
-      tax_breakdown: [
-        { rate: 10, target_amount: 14000, tax_amount: 1400 }
-      ],
-      invoice_number: "T5010001000001",
-      summary: "PC周辺機器（マウス・ケーブル）"
-    },
-    { 
-      id: "HIST-4", 
-      store_name: "スーパーマルエツ", 
-      transaction_date: "2026-10-25", 
-      total_amount: 3240,
-      tax_amount: 240,
-      tax_breakdown: [
-        { rate: 8, target_amount: 3000, tax_amount: 240 }
-      ],
-      invoice_number: null,
-      summary: "イベント用備品・飲料"
-    }
-  ]);
+  // History Records (Loaded from localStorage)
+  const [historyRecords, setHistoryRecords] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEY_HISTORY);
+    return saved ? JSON.parse(saved) : DEFAULT_HISTORY;
+  });
+
+  // Save history to localStorage
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(historyRecords));
+  }, [historyRecords]);
 
   // Analytics Filter States
   const [analyticsFilterMonth, setAnalyticsFilterMonth] = useState("ALL");
@@ -151,10 +147,53 @@ export default function App() {
   const [zoomLevel, setZoomLevel] = useState(1);
   const [showHistory, setShowHistory] = useState(false);
   const [notification, setNotification] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // --- CAMERA HANDLING ---
+  const startCamera = async () => {
+    try {
+      setIsCameraActive(true);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+    } catch (err) {
+      console.error(err);
+      showToast("カメラの起動に失敗しました。アクセス許可を確認してください。", "error");
+      setIsCameraActive(false);
+    }
+  };
+
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    setIsCameraActive(false);
+  };
+
+  const capturePhoto = () => {
+    if (!videoRef.current) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = videoRef.current.videoWidth;
+    canvas.height = videoRef.current.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+    
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+    setImagePreviewUrl(dataUrl);
+    setSelectedFile(null); // Clear raw File object, will use Base64 directly
+    stopCamera();
+    showToast("キャプチャが完了しました。", "success");
+  };
 
   // --- ANALYTICS CALCULATIONS ---
   const filteredAnalyticsData = historyRecords.filter(item => {
-    if (analyticsFilterMonth !== "ALL" && !item.transaction_date.startsWith(analyticsFilterMonth)) {
+    if (analyticsFilterMonth !== "ALL" && !item.transaction_date?.startsWith(analyticsFilterMonth)) {
       return false;
     }
     if (analyticsInvoiceOnly && !item.invoice_number) {
@@ -206,9 +245,9 @@ export default function App() {
       const b10 = (item.tax_breakdown || []).find(b => Number(b.rate) === 10) || {};
       const b8 = (item.tax_breakdown || []).find(b => Number(b.rate) === 8) || {};
       const tax = item.tax_amount || 0;
-      const exc = item.total_amount - tax;
+      const exc = (item.total_amount || 0) - tax;
 
-      csvContent += `"${item.id}","${item.transaction_date}","${item.store_name}","${item.summary || ''}",${item.total_amount},${tax},${exc},${b10.target_amount || 0},${b10.tax_amount || 0},${b8.target_amount || 0},${b8.tax_amount || 0},"${item.invoice_number || ''}"\n`;
+      csvContent += `"${item.id}","${item.transaction_date || ''}","${item.store_name || ''}","${item.summary || ''}",${item.total_amount || 0},${tax},${exc},${b10.target_amount || 0},${b10.tax_amount || 0},${b8.target_amount || 0},${b8.tax_amount || 0},"${item.invoice_number || ''}"\n`;
     });
 
     const encodedUri = encodeURI(csvContent);
@@ -219,6 +258,13 @@ export default function App() {
     link.click();
     document.body.removeChild(link);
     showToast("CSVデータのダウンロードを開始しました。", "success");
+  };
+
+  const saveApiKey = (key) => {
+    setApiKey(key);
+    localStorage.setItem(STORAGE_KEY_API, key);
+    setShowSettingsModal(false);
+    showToast("APIキーを保存しました。", "success");
   };
 
   const showToast = (message, type = "info") => {
@@ -238,16 +284,40 @@ export default function App() {
     });
   };
 
-  const handleFileUpload = (e) => {
-    const file = e.target.files[0];
+  const processFileSelection = (file) => {
     if (!file) return;
-
+    if (!file.type.startsWith('image/') && file.type !== 'application/pdf') {
+      showToast("画像(JPEG/PNG)またはPDFファイルを選択してください。", "error");
+      return;
+    }
     setSelectedFile(file);
     const reader = new FileReader();
     reader.onload = (event) => {
       setImagePreviewUrl(event.target.result);
     };
     reader.readAsDataURL(file);
+  };
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    processFileSelection(file);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      processFileSelection(e.dataTransfer.files[0]);
+    }
   };
 
   const validateReceiptData = (receipt, history) => {
@@ -295,8 +365,8 @@ export default function App() {
 
   // OCR Processing Function
   const processReceiptImage = async () => {
-    if (!selectedFile && !imagePreviewUrl) {
-      showToast("領収書画像を選択してください。", "error");
+    if (!imagePreviewUrl) {
+      showToast("領収書画像を選択または撮影してください。", "error");
       return;
     }
 
@@ -305,16 +375,25 @@ export default function App() {
 
     try {
       let base64Data = "";
+      let mimeType = "image/jpeg";
+
       if (selectedFile) {
         base64Data = await fileToBase64(selectedFile);
+        mimeType = selectedFile.type === 'application/pdf' ? 'image/png' : (selectedFile.type || 'image/jpeg');
+      } else if (imagePreviewUrl.startsWith("data:")) {
+        const parts = imagePreviewUrl.split(",");
+        mimeType = parts[0].match(/:(.*?);/)[1];
+        base64Data = parts[1];
       } else {
         throw new Error("画像データの取得に失敗しました。");
       }
 
       setProcessingStep("AIによる領収書の解析中...");
 
-      const apiKey = ""; // Canvas handles environment API key
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VISION_MODEL}:generateContent?key=${apiKey}`;
+      // API Key Logic: prioritize local input, fallback to environment if present
+      const effectiveApiKey = apiKey || (typeof process !== 'undefined' ? process.env.REACT_APP_GEMINI_API_KEY : "");
+      
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VISION_MODEL}:generateContent?key=${effectiveApiKey}`;
 
       const payload = {
         contents: [
@@ -324,7 +403,7 @@ export default function App() {
               { text: "添付された画像からすべての領収書情報を解析し、規定のJSONフォーマットで回答してください。" },
               {
                 inlineData: {
-                  mimeType: selectedFile?.type === 'application/pdf' ? 'image/png' : (selectedFile?.type || 'image/jpeg'),
+                  mimeType: mimeType,
                   data: base64Data
                 }
               }
@@ -347,7 +426,8 @@ export default function App() {
       });
 
       if (!response.ok) {
-        throw new Error(`APIエラーが発生しました: ${response.status}`);
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error(errJson.error?.message || `APIエラーが発生しました: Status ${response.status}`);
       }
 
       setProcessingStep("検証・整合性チェック処理中...");
@@ -383,7 +463,7 @@ export default function App() {
 
     } catch (err) {
       console.error(err);
-      showToast(`解析に失敗しました: ${err.message}`, "error");
+      showToast(`解析エラー: ${err.message}`, "error");
     } finally {
       setIsProcessing(false);
     }
@@ -435,6 +515,11 @@ export default function App() {
     setActiveReceiptIndex(0);
   };
 
+  const deleteHistoryRecord = (id) => {
+    setHistoryRecords(prev => prev.filter(r => r.id !== id));
+    showToast("履歴レコードを削除しました。", "info");
+  };
+
   const currentReceipt = extractedReceipts[activeReceiptIndex];
 
   return (
@@ -455,6 +540,87 @@ export default function App() {
         </div>
       )}
 
+      {/* API Key Modal */}
+      {showSettingsModal && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h2 className="font-bold text-slate-100 text-base flex items-center gap-2">
+                <Settings className="w-5 h-5 text-indigo-400" />
+                API 設定 (Google Gemini)
+              </h2>
+              <button onClick={() => setShowSettingsModal(false)} className="text-slate-400 hover:text-slate-200">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Google AI Studio 等で発行した Gemini API キーを入力してください。キーはお使いのブラウザ内（Local Storage）にのみ保存されます。
+            </p>
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">Gemini API Key</label>
+              <input
+                type="password"
+                placeholder="AIzaSy..."
+                defaultValue={apiKey}
+                id="apiKeyInput"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-500 font-mono"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => setShowSettingsModal(false)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold"
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={() => saveApiKey(document.getElementById("apiKeyInput").value)}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5"
+              >
+                <Save className="w-4 h-4" />
+                保存する
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Camera Modal */}
+      {isCameraActive && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur z-50 flex flex-col items-center justify-between p-4">
+          <div className="w-full max-w-lg flex justify-between items-center text-slate-200">
+            <span className="text-sm font-semibold flex items-center gap-2">
+              <Camera className="w-4 h-4 text-indigo-400" /> 領収書を撮影
+            </span>
+            <button onClick={stopCamera} className="p-2 hover:bg-slate-800 rounded-full">
+              <X className="w-6 h-6" />
+            </button>
+          </div>
+
+          <div className="relative w-full max-w-lg bg-black rounded-2xl overflow-hidden aspect-[3/4] flex items-center justify-center border border-slate-800">
+            <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" />
+            <div className="absolute inset-8 border-2 border-dashed border-white/40 rounded-xl pointer-events-none flex items-center justify-center">
+              <span className="text-xs text-white/60 bg-black/40 px-3 py-1 rounded-full">枠内に領収書を合わせてください</span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-6 pb-4">
+            <button
+              onClick={stopCamera}
+              className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold"
+            >
+              キャンセル
+            </button>
+            <button
+              onClick={capturePhoto}
+              className="p-5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full shadow-2xl transition ring-4 ring-indigo-500/30"
+            >
+              <Camera className="w-7 h-7" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur sticky top-0 z-40 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -462,8 +628,8 @@ export default function App() {
             <FileText className="w-6 h-6" />
           </div>
           <div>
-            <h1 className="font-bold text-lg text-white leading-tight">AI 領収書読取・経費精算</h1>
-            <p className="text-xs text-slate-400">Gemini 3.1 OCR & 消費税別・税込多角分析ツール</p>
+            <h1 className="font-bold text-lg text-white leading-tight">AI 領収書読取・経費精算 Pro</h1>
+            <p className="text-xs text-slate-400">Gemini Vision OCR & 消費税別・インボイス多角分析</p>
           </div>
         </div>
 
@@ -477,7 +643,7 @@ export default function App() {
               }`}
             >
               <FileText className="w-4 h-4" />
-              <span>領収書読取 & 修正</span>
+              <span>領収書読取</span>
             </button>
             <button
               onClick={() => setActiveTab("analytics")}
@@ -492,6 +658,14 @@ export default function App() {
               </span>
             </button>
           </div>
+
+          <button
+            onClick={() => setShowSettingsModal(true)}
+            className="p-2 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
+            title="API設定"
+          >
+            <Key className={`w-4 h-4 ${apiKey ? 'text-emerald-400' : 'text-amber-400'}`} />
+          </button>
 
           <button
             onClick={() => setShowHistory(!showHistory)}
@@ -541,17 +715,35 @@ export default function App() {
               )}
             </div>
 
-            <div className="flex-1 overflow-auto p-4 flex items-center justify-center relative bg-slate-950/50">
+            <div 
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              className={`flex-1 overflow-auto p-4 flex items-center justify-center relative bg-slate-950/50 transition ${
+                isDragging ? 'border-2 border-indigo-500 bg-indigo-500/10' : ''
+              }`}
+            >
               {!imagePreviewUrl ? (
                 <div className="text-center p-8 max-w-sm border-2 border-dashed border-slate-800 rounded-2xl hover:border-slate-700 transition">
                   <Upload className="w-12 h-12 text-slate-600 mx-auto mb-3" />
                   <h3 className="text-sm font-semibold text-slate-300 mb-1">領収書・レシート画像をアップロード</h3>
-                  <p className="text-xs text-slate-500 mb-4">JPEG, PNG, PDFに対応。1枚に複数枚含まれていても自動認識します。</p>
-                  <label className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold cursor-pointer shadow-lg transition">
-                    <Upload className="w-4 h-4" />
-                    ファイルを選択
-                    <input type="file" accept="image/jpeg,image/png,application/pdf" className="hidden" onChange={handleFileUpload} />
-                  </label>
+                  <p className="text-xs text-slate-500 mb-4">ここにドロップするか、ファイル選択・カメラ撮影を行ってください。</p>
+                  
+                  <div className="flex items-center justify-center gap-3">
+                    <label className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold cursor-pointer shadow-lg transition">
+                      <Upload className="w-4 h-4" />
+                      ファイル選択
+                      <input type="file" accept="image/jpeg,image/png,application/pdf" className="hidden" onChange={handleFileUpload} />
+                    </label>
+
+                    <button
+                      onClick={startCamera}
+                      className="inline-flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold border border-slate-700 transition"
+                    >
+                      <Camera className="w-4 h-4 text-indigo-400" />
+                      カメラで撮影
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <div className="relative inline-block transition-transform duration-200" style={{ transform: `scale(${zoomLevel})` }}>
@@ -596,11 +788,19 @@ export default function App() {
 
             {imagePreviewUrl && (
               <div className="p-4 border-t border-slate-800 bg-slate-900/80 flex items-center justify-between gap-4">
-                <label className="text-xs text-slate-400 hover:text-slate-200 cursor-pointer flex items-center gap-1.5">
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  別の画像を選択
-                  <input type="file" accept="image/jpeg,image/png,application/pdf" className="hidden" onChange={handleFileUpload} />
-                </label>
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-slate-400 hover:text-slate-200 cursor-pointer flex items-center gap-1.5">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    再選択
+                    <input type="file" accept="image/jpeg,image/png,application/pdf" className="hidden" onChange={handleFileUpload} />
+                  </label>
+                  <button
+                    onClick={startCamera}
+                    className="text-xs text-slate-400 hover:text-slate-200 flex items-center gap-1.5"
+                  >
+                    <Camera className="w-3.5 h-3.5" /> 再撮影
+                  </button>
+                </div>
 
                 <button
                   onClick={processReceiptImage}
@@ -614,7 +814,7 @@ export default function App() {
                     </>
                   ) : (
                     <>
-                      <FileText className="w-4 h-4" />
+                      <Sparkles className="w-4 h-4 text-amber-300" />
                       <span>AIで解析を実行</span>
                     </>
                   )}
@@ -652,7 +852,7 @@ export default function App() {
               <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-slate-500">
                 <FileText className="w-12 h-12 stroke-[1.5] text-slate-700 mb-3" />
                 <p className="text-sm font-medium text-slate-400">解析データがありません</p>
-                <p className="text-xs mt-1 max-w-xs">左側で画像をアップロードし、「AIで解析を実行」ボタンを押してください。</p>
+                <p className="text-xs mt-1 max-w-xs">左側で画像をアップロードまたはカメラ撮影し、「AIで解析を実行」ボタンを押してください。</p>
               </div>
             ) : (
               <div className="p-6 space-y-6 flex-1">
@@ -865,7 +1065,7 @@ export default function App() {
               <div className="text-2xl font-bold font-mono text-emerald-400">
                 ￥{totalIncTax.toLocaleString()}
               </div>
-              <p className="text-[11px] text-slate-500">全選択件数の支払支払総額</p>
+              <p className="text-[11px] text-slate-500">全選択件数の支払総額</p>
               <div className="absolute bottom-0 left-0 right-0 h-1 bg-emerald-500/40"></div>
             </div>
 
@@ -996,19 +1196,20 @@ export default function App() {
                     <th className="p-3 text-right">消費税額</th>
                     <th className="p-3 text-right">税抜金額</th>
                     <th className="p-3 text-center">インボイス</th>
+                    <th className="p-3 text-center">操作</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
                   {filteredAnalyticsData.length === 0 ? (
                     <tr>
-                      <td colSpan="7" className="p-6 text-center text-slate-500">
+                      <td colSpan="8" className="p-6 text-center text-slate-500">
                         該当するデータが存在しません。
                       </td>
                     </tr>
                   ) : (
                     filteredAnalyticsData.map(item => {
                       const tax = item.tax_amount || 0;
-                      const exc = item.total_amount - tax;
+                      const exc = (item.total_amount || 0) - tax;
                       return (
                         <tr key={item.id} className="hover:bg-slate-900/50 transition">
                           <td className="p-3 font-mono">{item.transaction_date}</td>
@@ -1033,6 +1234,15 @@ export default function App() {
                                 なし
                               </span>
                             )}
+                          </td>
+                          <td className="p-3 text-center">
+                            <button
+                              onClick={() => deleteHistoryRecord(item.id)}
+                              className="p-1 hover:bg-slate-800 text-slate-500 hover:text-red-400 rounded transition"
+                              title="削除"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
                           </td>
                         </tr>
                       );
@@ -1068,7 +1278,7 @@ export default function App() {
                   <p className="text-xs text-slate-500">履歴がまだありません。</p>
                 ) : (
                   historyRecords.map(item => (
-                    <div key={item.id} className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1">
+                    <div key={item.id} className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1 relative group">
                       <div className="flex items-center justify-between text-xs font-semibold text-slate-200">
                         <span>{item.store_name}</span>
                         <span className="text-indigo-400 font-mono">￥{item.total_amount?.toLocaleString()}</span>
@@ -1077,6 +1287,12 @@ export default function App() {
                         <span>{item.transaction_date}</span>
                         <span>消費税: ￥{(item.tax_amount || 0).toLocaleString()}</span>
                       </div>
+                      <button
+                        onClick={() => deleteHistoryRecord(item.id)}
+                        className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 p-1 text-slate-500 hover:text-red-400 transition"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
                     </div>
                   ))
                 )}
